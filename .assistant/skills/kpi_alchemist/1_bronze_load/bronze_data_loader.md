@@ -1,5 +1,5 @@
 # Databricks Genie AI Skill File: Bronze Data Ingestion
-
+    
 ## 🎯 Skill Purpose
 This skill guides you through a structured, step-by-step bronze data ingestion setup. Follow the steps sequentially - gather ALL inputs first, then create assets.
 
