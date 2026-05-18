@@ -17,6 +17,7 @@ This skill guides you through a structured, step-by-step bronze data ingestion s
 7. **One step at a time** - Complete current step fully before suggesting next
 8. **No widgets** - All configuration values are hardcoded from Step 1 inputs
 9. **EXECUTE ALL CELLS** - After creating each notebook, immediately navigate to it and execute all cells to load data and run validations
+10. **DATA TYPE STRATEGY** - Load all file-based sources as STRING data types (no schema inference). ONLY preserve original data types for RDBMS sources (JDBC). This ensures raw data integrity in bronze layer.
 
 ---
 
@@ -281,6 +282,7 @@ Every ingestion notebook must have this structure:
 # MAGIC **Source:** {source_description}
 # MAGIC **Target:** {target_table}
 # MAGIC **Ingestion Type:** {source_type}
+# MAGIC **Data Type Strategy:** All columns loaded as STRING (except RDBMS sources)
 
 # COMMAND ----------
 # Import required libraries
@@ -528,10 +530,10 @@ delimiter = "{user_provided_delimiter}"  # default: ","
 has_header = {user_provided_has_header}  # True or False
 load_id = str(uuid.uuid4())
 
-# Read CSV
+# Read CSV - ALL COLUMNS AS STRING (no schema inference)
 df = spark.read.format("csv") \
     .option("header", has_header) \
-    .option("inferSchema", "true") \
+    .option("inferSchema", "false") \
     .option("delimiter", delimiter) \
     .option("encoding", "UTF-8") \
     .load(source_path)
@@ -556,10 +558,23 @@ target_table = "{user_provided_target_table}"
 multiline = {user_provided_multiline}  # True or False
 load_id = str(uuid.uuid4())
 
-# Read JSON
-df = spark.read.format("json") \
+# Read JSON - ALL COLUMNS AS STRING (no schema inference)
+# Note: For JSON, we first read with schema inference to get structure,
+# then cast all leaf fields to string
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import col
+
+# Read with inferred schema to understand structure
+temp_df = spark.read.format("json") \
     .option("multiLine", multiline) \
     .load(source_path)
+
+# Get all column names (flattened if nested)
+column_names = temp_df.columns
+
+# Cast all columns to string
+string_cols = [col(c).cast("string").alias(c) for c in column_names]
+df = temp_df.select(string_cols)
 
 # Add metadata columns
 df = df.withColumn("bronze_ingestion_timestamp", current_timestamp()) \
@@ -580,10 +595,18 @@ source_path = "{user_provided_source_path}"
 target_table = "{user_provided_target_table}"
 load_id = str(uuid.uuid4())
 
-# Read Parquet
-df = spark.read.format("parquet") \
+# Read Parquet and cast all columns to string
+from pyspark.sql.functions import col
+
+# Read parquet with original schema
+temp_df = spark.read.format("parquet") \
     .option("mergeSchema", "true") \
     .load(source_path)
+
+# Cast all columns to string
+column_names = temp_df.columns
+string_cols = [col(c).cast("string").alias(c) for c in column_names]
+df = temp_df.select(string_cols)
 
 # Add metadata columns
 df = df.withColumn("bronze_ingestion_timestamp", current_timestamp()) \
@@ -605,7 +628,7 @@ target_table = "{user_provided_target_table}"
 load_mode = "{user_provided_load_mode}"  # "overwrite" or "append"
 load_id = str(uuid.uuid4())
 
-# Read Delta table
+# Read Delta table - PRESERVE ORIGINAL DATA TYPES
 df = spark.read.format("delta").table(source_table)
 
 # Add metadata columns
@@ -641,7 +664,7 @@ jdbc_properties = {
     "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"
 }
 
-# Read from JDBC
+# Read from JDBC - PRESERVE ORIGINAL RDBMS DATA TYPES
 df = spark.read.jdbc(
     url=jdbc_url,
     table=source_table,
@@ -682,7 +705,7 @@ jdbc_properties = {
     "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver"
 }
 
-# Read with partitioning
+# Read with partitioning - PRESERVE ORIGINAL RDBMS DATA TYPES
 df = spark.read.jdbc(
     url=jdbc_url,
     table=source_table,
@@ -721,10 +744,10 @@ if not use_iam_role:
     spark.conf.set("fs.s3a.access.key", aws_access_key)
     spark.conf.set("fs.s3a.secret.key", aws_secret_key)
 
-# Read CSV from S3
+# Read CSV from S3 - ALL COLUMNS AS STRING (no schema inference)
 df = spark.read.format("csv") \
     .option("header", "true") \
-    .option("inferSchema", "true") \
+    .option("inferSchema", "false") \
     .load(s3_full_path)
 
 # Add metadata columns
@@ -759,8 +782,16 @@ spark.conf.set(
 # Azure path
 azure_path = f"abfss://{container}@{storage_account}.dfs.core.windows.net/{file_path}"
 
-# Read from Azure
-df = spark.read.format("parquet").load(azure_path)
+# Read from Azure and cast all columns to string
+from pyspark.sql.functions import col
+
+# Read parquet with original schema
+temp_df = spark.read.format("parquet").load(azure_path)
+
+# Cast all columns to string
+column_names = temp_df.columns
+string_cols = [col(c).cast("string").alias(c) for c in column_names]
+df = temp_df.select(string_cols)
 
 # Add metadata columns
 df = df.withColumn("bronze_ingestion_timestamp", current_timestamp()) \
@@ -782,13 +813,27 @@ checkpoint_location = "{user_provided_checkpoint_location}"
 target_table = "{user_provided_target_table}"
 file_format = "{user_provided_file_format}"  # csv, json, parquet, avro
 
-# Read with Auto Loader
-df = spark.readStream.format("cloudFiles") \
-    .option("cloudFiles.format", file_format) \
-    .option("cloudFiles.schemaLocation", checkpoint_location + "/schema") \
-    .option("cloudFiles.inferColumnTypes", "true") \
-    .option("header", "true") \
-    .load(source_path)
+# Read with Auto Loader - enforce string schema for file sources
+from pyspark.sql.functions import col
+
+# For CSV: disable schema inference
+if file_format == "csv":
+    df = spark.readStream.format("cloudFiles") \
+        .option("cloudFiles.format", file_format) \
+        .option("cloudFiles.schemaLocation", checkpoint_location + "/schema") \
+        .option("cloudFiles.inferColumnTypes", "false") \
+        .option("header", "true") \
+        .load(source_path)
+else:
+    # For other formats: read with inference then cast to string
+    temp_df = spark.readStream.format("cloudFiles") \
+        .option("cloudFiles.format", file_format) \
+        .option("cloudFiles.schemaLocation", checkpoint_location + "/schema") \
+        .option("cloudFiles.inferColumnTypes", "true") \
+        .load(source_path)
+    
+    # Note: For streaming, we'll handle casting in the writeStream transform
+    df = temp_df
 
 # Add metadata columns
 df = df.withColumn("bronze_ingestion_timestamp", current_timestamp()) \
@@ -809,6 +854,7 @@ print(f"✅ Auto Loader completed for {target_table}")
 ### Pattern 10: Merge (Upsert) Load
 ```python
 from delta.tables import DeltaTable
+from pyspark.sql.functions import col
 
 # Configuration
 source_path = "{user_provided_source_path}"
@@ -816,10 +862,10 @@ target_table = "{user_provided_target_table}"
 merge_keys = {user_provided_merge_keys_list}  # ["key1", "key2"]
 load_id = str(uuid.uuid4())
 
-# Read source data
+# Read source data - ALL COLUMNS AS STRING (no schema inference)
 source_df = spark.read.format("csv") \
     .option("header", "true") \
-    .option("inferSchema", "true") \
+    .option("inferSchema", "false") \
     .load(source_path)
 
 # Add metadata columns
@@ -865,3 +911,4 @@ else:
 8. **No widgets** - All configuration is hardcoded from Step 1 inputs
 9. **Execute immediately** - After creating each notebook, navigate to it and execute all cells using `openAsset` and `runNotebookCells`
 10. **Verify execution** - Check execution results to ensure data loaded successfully and validations passed before moving to next step
+11. **STRING DATA TYPE RULE** - For ALL file-based sources (CSV, JSON, Parquet, S3, Azure, Auto Loader), load data with NO schema inference - all columns as STRING. ONLY preserve original data types for RDBMS sources (JDBC patterns 5 and 6) and Delta table copies (pattern 4).

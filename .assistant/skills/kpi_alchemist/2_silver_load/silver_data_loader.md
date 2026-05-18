@@ -18,6 +18,28 @@ This skill guides you through a structured, step-by-step silver data transformat
 8. **No widgets** - All configuration values are hardcoded from Step 1 inputs
 9. **EXECUTE ALL CELLS** - After creating each notebook, immediately navigate to it and execute all cells to analyze data and perform transformations
 10. **Data Type Intelligence** - Always analyze sample data and distinct values before choosing data types
+11. **ALWAYS CHECK REFERENCE FILE** - Before applying transformations, read the reference file at `/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformations.md` for standard transformation rules and examples
+12. **STEP 4 READS TRANSFORMATIONS** - The data profiling notebook (Step 4) must read the transformations.md reference file to understand what calculated fields and transformations are needed
+
+---
+
+## 📚 TRANSFORMATION REFERENCE FILE
+
+**MANDATORY:** Before proceeding with Step 4 (Data Profiling) and Step 6 (Additional Transformations), always read and apply rules from:
+
+**File Path:** `/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md`
+
+This reference file contains:
+* Standard calculated field logic (e.g., total_price calculations)
+* String standardization rules (e.g., customer name formatting)
+* Common transformation patterns
+* Business logic conventions
+
+**Action Required:**
+1. Read the reference file using `readFile` tool
+2. Parse transformation rules from the reference
+3. Apply these rules as default transformations in Step 4 analysis and Step 6 execution
+4. If user provides additional README file, merge both sets of rules
 
 ---
 
@@ -64,6 +86,7 @@ This skill guides you through a structured, step-by-step silver data transformat
   1. Auto Type Detection (Analyze sample data and automatically choose best data types)
   2. Manual Type Specification (You specify exact types for each column)
   3. Schema on Read (Keep all as string, let downstream queries cast)
+  4. Load from ./references (transformation_reference_path)
 - **Store as:** `transformation_mode`
 
 #### 1.5 Confirmation
@@ -227,10 +250,13 @@ print(f"\n✅ Verification complete: {catalog_name}.{schema_name} is ready for u
 
 **Only execute after Step 3 is complete**
 
+**IMPORTANT:** This step now includes reading the transformation reference file to understand what calculated fields and transformations are needed. This ensures type recommendations consider both raw data AND transformation requirements.
+
 #### 4.1 Create Data Profiling Notebook
 - **Action:** Create a Python notebook named `02_analyze_bronze_data`
 - **Location:** `{base_path}/SRC/02_analyze_bronze_data`
 - **Content:** Use template below with user-provided values
+- **Key Enhancement:** Reads transformations.md file BEFORE analyzing data to identify source columns needed for calculated fields
 
 **Template for Data Profiling Notebook:**
 ```python
@@ -242,16 +268,64 @@ print(f"\n✅ Verification complete: {catalog_name}.{schema_name} is ready for u
 # MAGIC **Source Table:** {source_bronze_table}
 # MAGIC **Target Table:** {target_silver_table}
 # MAGIC 
-# MAGIC This notebook analyzes bronze data and recommends optimal data types for silver layer
+# MAGIC This notebook analyzes bronze data and recommends optimal data types for silver layer.
+# MAGIC It also reads transformation rules to ensure source columns are properly typed for calculated fields.
 
 # COMMAND ----------
 # Configuration
 source_table = "{source_bronze_table}"
 target_table = "{target_silver_table}"
+transformation_reference_path = "/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md"
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 1: Read Bronze Table Sample
+# MAGIC ## Step 1: Read Transformation Reference File
+
+# COMMAND ----------
+# Read transformation reference to understand what calculated fields are needed
+import re
+
+transformation_rules = {}
+required_source_columns = []
+calculated_fields = []
+
+try:
+    with open(transformation_reference_path.replace("/Workspace", "/Workspace"), 'r') as f:
+        transformation_content = f.read()
+    
+    print("📄 Transformation Reference File Content:")
+    print("=" * 80)
+    print(transformation_content)
+    print("=" * 80)
+    
+    # Parse for calculated field patterns
+    # Look for patterns like: total_price = price * quantity
+    calc_pattern = r'(\w+)\s*[=:]\s*(.+?)(?:\n|$)'
+    matches = re.findall(calc_pattern, transformation_content, re.MULTILINE)
+    
+    for field_name, formula in matches:
+        if any(keyword in formula.lower() for keyword in ['*', '+', '-', '/', 'cast', 'upper', 'lower', 'trim']):
+            calculated_fields.append(field_name)
+            # Extract column names from formula (simple heuristic)
+            column_refs = re.findall(r'\b([a-z_][a-z0-9_]*)\b', formula.lower())
+            required_source_columns.extend(column_refs)
+            transformation_rules[field_name] = formula
+    
+    print(f"\n✅ Found {len(calculated_fields)} calculated fields:")
+    for field in calculated_fields:
+        print(f"  - {field}: {transformation_rules.get(field, 'N/A')}")
+    
+    print(f"\n📊 Source columns needed for transformations:")
+    print(f"  {list(set(required_source_columns))}")
+    
+except Exception as e:
+    print(f"⚠️ Could not read transformation reference file: {e}")
+    print("ℹ️ Continuing with basic type analysis only")
+    transformation_content = ""
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Step 2: Read Bronze Table Sample
 
 # COMMAND ----------
 # Read bronze table
@@ -269,14 +343,14 @@ print(f"📊 Sample size for analysis: {sample_df.count():,} rows")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 2: Display Sample Data
+# MAGIC ## Step 3: Display Sample Data
 
 # COMMAND ----------
 display(sample_df.limit(100))
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 3: Analyze Current Schema
+# MAGIC ## Step 4: Analyze Current Schema
 
 # COMMAND ----------
 # Show current schema
@@ -285,7 +359,7 @@ bronze_df.printSchema()
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 4: Column-by-Column Analysis
+# MAGIC ## Step 5: Column-by-Column Analysis with Transformation Awareness
 
 # COMMAND ----------
 from pyspark.sql import functions as F
@@ -298,6 +372,11 @@ for col_name in sample_df.columns:
     print(f"\n{'='*60}")
     print(f"📊 Analyzing column: {col_name}")
     print(f"{'='*60}")
+    
+    # Check if this column is used in transformations
+    used_in_transformations = col_name in required_source_columns
+    if used_in_transformations:
+        print(f"  ⚠️ This column is used in transformation calculations")
     
     # Get current type
     current_type = dict(sample_df.dtypes)[col_name]
@@ -320,6 +399,7 @@ for col_name in sample_df.columns:
     
     # Recommend data type based on analysis
     recommended_type = current_type  # Default to current type
+    recommendation_reason = "Keep current type"
     
     if current_type == "string" and distinct_count < sample_df.count():
         # Try to infer better type
@@ -331,7 +411,13 @@ for col_name in sample_df.columns:
                 # Test for integer
                 int_values = [int(v) for v in sample_values]
                 recommended_type = "BIGINT"
-                print(f"  ✅ Recommendation: BIGINT (all values are integers)")
+                recommendation_reason = "All values are integers"
+                
+                # If used in calculations, prioritize numeric type
+                if used_in_transformations:
+                    recommendation_reason += " (REQUIRED for calculations)"
+                
+                print(f"  ✅ Recommendation: BIGINT ({recommendation_reason})")
             except:
                 try:
                     # Test for decimal
@@ -346,18 +432,26 @@ for col_name in sample_df.columns:
                     
                     if max_decimal_places > 0 and max_decimal_places <= 4:
                         recommended_type = f"DECIMAL(30, {max_decimal_places})"
-                        print(f"  ✅ Recommendation: DECIMAL(30, {max_decimal_places}) (decimal values detected)")
+                        recommendation_reason = f"Decimal values detected with {max_decimal_places} decimal places"
                     else:
                         recommended_type = "DOUBLE"
-                        print(f"  ✅ Recommendation: DOUBLE (floating point values)")
+                        recommendation_reason = "Floating point values"
+                    
+                    # If used in calculations, prioritize numeric type
+                    if used_in_transformations:
+                        recommendation_reason += " (REQUIRED for calculations)"
+                    
+                    print(f"  ✅ Recommendation: {recommended_type} ({recommendation_reason})")
                 except:
                     # Check if it's a date
                     if any(keyword in col_name.lower() for keyword in ['date', 'dt', 'time', 'timestamp']):
                         recommended_type = "TIMESTAMP"
-                        print(f"  ✅ Recommendation: TIMESTAMP (column name suggests temporal data)")
+                        recommendation_reason = "Column name suggests temporal data"
+                        print(f"  ✅ Recommendation: TIMESTAMP ({recommendation_reason})")
                     else:
                         recommended_type = "STRING"
-                        print(f"  ✅ Recommendation: STRING (keep as text)")
+                        recommendation_reason = "Keep as text"
+                        print(f"  ✅ Recommendation: STRING ({recommendation_reason})")
     
     column_analysis.append({
         "column_name": col_name,
@@ -365,12 +459,14 @@ for col_name in sample_df.columns:
         "recommended_type": recommended_type,
         "distinct_count": distinct_count,
         "null_count": null_count,
-        "null_percentage": f"{null_percentage:.2f}%"
+        "null_percentage": f"{null_percentage:.2f}%",
+        "used_in_transformations": "Yes" if used_in_transformations else "No",
+        "recommendation_reason": recommendation_reason
     })
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 5: Summary of Recommendations
+# MAGIC ## Step 6: Summary of Recommendations
 
 # COMMAND ----------
 import pandas as pd
@@ -387,7 +483,7 @@ print("\n📋 Next Step: Review recommendations and proceed to create transforma
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 6: Generate Transformation SQL
+# MAGIC ## Step 7: Generate Transformation SQL with Calculated Fields
 
 # COMMAND ----------
 # Generate CAST statements
@@ -400,6 +496,13 @@ for analysis in column_analysis:
         cast_statements.append(f"  CAST({col} AS {rec_type}) AS {col}")
     else:
         cast_statements.append(f"  {col}")
+
+# Add placeholders for calculated fields from transformation rules
+if calculated_fields:
+    cast_statements.append("\n  -- Calculated fields (from transformation rules):")
+    for calc_field in calculated_fields:
+        formula = transformation_rules.get(calc_field, "TBD")
+        cast_statements.append(f"  -- {calc_field} = {formula}")
 
 # Generate full SQL
 transformation_sql = f"""
@@ -419,14 +522,17 @@ print(transformation_sql)
 dbutils.jobs.taskValues.set(key="transformation_sql", value=transformation_sql)
 
 print("\n✅ Transformation SQL ready for next step")
+print("\n📊 Identified calculated fields that will be added in Step 6:")
+for field in calculated_fields:
+    print(f"  - {field}")
 ```
 
 #### 4.2 Execute Data Profiling Notebook
-- **Action:** Navigate to the created notebook using `openAsset` with `continueMessage: "Execute all cells in this data profiling notebook to analyze bronze data and generate type recommendations"`
+- **Action:** Navigate to the created notebook using `openAsset` with `continueMessage: "Execute all cells in this data profiling notebook to analyze bronze data, read transformation rules, and generate type recommendations"`
 - **Agent on notebook page will:** Execute all cells sequentially using `runNotebookCells`
-- **Validation:** Review the analysis results and type recommendations
+- **Validation:** Review the analysis results, type recommendations, and identified transformation requirements
 - **Return:** Navigate back after successful analysis
-- **Output:** "✅ Step 4 Complete: Bronze data analyzed and type recommendations generated"
+- **Output:** "✅ Step 4 Complete: Bronze data analyzed, transformation rules parsed, and type recommendations generated"
 
 ---
 
@@ -636,46 +742,54 @@ print(f"  - Retention rate: {(silver_count/bronze_count)*100:.2f}%")
 
 ### STEP 6: APPLY ADDITIONAL TRANSFORMATIONS (OPTIONAL)
 
-**Only execute if user has a README file with transformation logic**
+**MANDATORY: Step 4 already read reference file, now apply the transformations and ask about user's README file**
 
-#### 6.1 Ask User for README File
-- **Action:** After Step 5 is complete and type casting is done, ask the user:
-- **Question:** "Do you have a README or markdown file with additional transformation logic? If yes, please provide the file path."
+#### 6.1 Confirm Transformation Rules Already Loaded
+- **Note:** The transformation reference file was already read and parsed in Step 4
+- **Available as:** `standard_transformation_rules` (from Step 4 analysis)
+- **Action:** Retrieve the transformation rules identified in Step 4
+
+#### 6.2 Ask User for Additional README File
+- **Action:** Ask the user:
+- **Question:** "In Step 4, I already loaded the standard transformation rules from the reference file. Do you have an additional README or markdown file with custom transformation logic? If yes, please provide the file path. If no, I'll proceed with the standard transformations only."
 - **Store as:** `readme_file_path`
-- **If user provides path, proceed to 6.2**
-- **If no file, skip to completion**
+- **If user provides path, proceed to 6.3**
+- **If no additional file, proceed to 6.4 with standard rules only**
 
-#### 6.2 Read and Parse README File
-- **Action:** Read the README file content
+#### 6.3 Read and Merge User's README File (if provided)
+- **Action:** Read the user's README file content
 - **Parse for:** 
   - Column transformations
   - Business logic rules
   - Calculated fields
   - Filters or conditions
   - Aggregations
-- **Store as:** `transformation_rules`
+- **Store as:** `custom_transformation_rules`
+- **Merge:** Combine `standard_transformation_rules` with `custom_transformation_rules`
 
-#### 6.3 Create Additional Transformation Notebook
-- **Action:** Create a Python notebook named `04_apply_readme_transformations`
-- **Location:** `{base_path}/SRC/04_apply_readme_transformations`
+#### 6.4 Create Additional Transformation Notebook
+- **Action:** Create a Python notebook named `04_apply_transformations`
+- **Location:** `{base_path}/SRC/04_apply_transformations`
 - **Content:** Use template below
 
-**Template for README Transformation Notebook:**
+**Template for Transformation Notebook:**
 ```python
 # Databricks notebook source
 # COMMAND ----------
 # MAGIC %md
-# MAGIC # Apply Additional Transformations from README
+# MAGIC # Apply Additional Transformations
 # MAGIC 
 # MAGIC **Source:** {target_silver_table}
-# MAGIC **README File:** {readme_file_path}
+# MAGIC **Standard Reference:** /Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md
+# MAGIC **Custom README:** {readme_file_path if provided else "None"}
 # MAGIC 
-# MAGIC This notebook applies business logic transformations defined in the README file
+# MAGIC This notebook applies business logic transformations defined in reference files
 
 # COMMAND ----------
 # Configuration
 source_table = "{target_silver_table}"
-readme_path = "{readme_file_path}"
+reference_path = "/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md"
+readme_path = "{readme_file_path}"  # Empty if not provided
 
 # COMMAND ----------
 # MAGIC %md
@@ -689,61 +803,75 @@ from pyspark.sql.types import *
 silver_df = spark.table(source_table)
 
 print(f"📊 Current silver table loaded: {silver_df.count():,} rows")
+print(f"📊 Available columns: {silver_df.columns}")
 silver_df.printSchema()
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 2: Display README Content
+# MAGIC ## Step 2: Display Reference Transformation Rules
 
 # COMMAND ----------
-# Read README file
-with open(readme_path.replace("/Workspace/", "/Workspace/"), "r") as f:
-    readme_content = f.read()
-
-print("📄 README Transformation Logic:")
+print("📄 Standard Transformation Reference:")
 print("=" * 80)
-print(readme_content)
+print("""
+{standard_transformation_rules}
+""")
 print("=" * 80)
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 3: Parse and Apply Transformations
+# MAGIC ## Step 3: Apply Standard Transformations
 
 # COMMAND ----------
-# NOTE: This section should be customized based on README content
-# Below is a template - AI agent will analyze README and generate specific code
+# AI Agent will parse the reference file and generate specific transformation code here
+# Example transformations based on the reference file:
 
-# Example transformations:
-# 1. Calculated fields
-# silver_df = silver_df.withColumn("new_calculated_field", F.col("field1") + F.col("field2"))
+# 1. Calculate total_price (check if price and units/qty exist)
+if "price" in silver_df.columns:
+    if "units" in silver_df.columns:
+        silver_df = silver_df.withColumn("total_price", F.col("price") * F.col("units"))
+        print("✅ Created total_price = price * units")
+    elif "qty" in silver_df.columns:
+        silver_df = silver_df.withColumn("total_price", F.col("price") * F.col("qty"))
+        print("✅ Created total_price = price * qty")
+    else:
+        print("ℹ️ Skipping total_price calculation - no units or qty column found")
+else:
+    print("ℹ️ Skipping total_price calculation - no price column found")
 
-# 2. Conditional logic
-# silver_df = silver_df.withColumn("status", 
-#     F.when(F.col("amount") > 1000, "High")
-#     .when(F.col("amount") > 500, "Medium")
-#     .otherwise("Low")
-# )
+# 2. Standardize customer names to uppercase
+customer_name_columns = [col for col in silver_df.columns if "customer" in col.lower() and "name" in col.lower()]
+for col_name in customer_name_columns:
+    silver_df = silver_df.withColumn(col_name, F.upper(F.col(col_name)))
+    print(f"✅ Converted {col_name} to uppercase")
 
-# 3. String transformations
-# silver_df = silver_df.withColumn("name_upper", F.upper(F.col("name")))
-
-# 4. Date calculations
-# silver_df = silver_df.withColumn("days_since", F.datediff(F.current_date(), F.col("event_date")))
-
-print("ℹ️ Apply your specific transformations based on README content")
-print("ℹ️ AI Agent will help convert README instructions to code")
+if not customer_name_columns:
+    print("ℹ️ No customer name columns found for uppercase conversion")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 4: Preview Transformed Data
+# MAGIC ## Step 4: Apply Custom Transformations (if README provided)
 
 # COMMAND ----------
-print("🔍 Preview after additional transformations:")
+# If user provided additional README file, custom transformations will be added here
+# AI Agent will parse the custom README and generate additional transformation code
+
+{custom_transformation_code}
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## Step 5: Preview Transformed Data
+
+# COMMAND ----------
+print("🔍 Preview after all transformations:")
 display(silver_df.limit(100))
 
+print("\n📊 Final Schema:")
+silver_df.printSchema()
+
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## Step 5: Update Silver Table
+# MAGIC ## Step 6: Update Silver Table
 
 # COMMAND ----------
 print(f"💾 Updating silver table: {source_table}")
@@ -756,30 +884,45 @@ silver_df.write \
     .saveAsTable(source_table)
 
 final_count = spark.table(source_table).count()
-print(f"\n✅ Silver table updated with additional transformations!")
+print(f"\n✅ Silver table updated with all transformations!")
 print(f"📊 Final row count: {final_count:,}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ## ✅ Additional Transformations Complete!
+# MAGIC ## Step 7: Verify Transformations
+
+# COMMAND ----------
+# Verify new columns were created
+result_df = spark.table(source_table)
+print("📊 Final Column List:")
+for col in result_df.columns:
+    print(f"  - {col}")
+
+print("\n✅ All transformations applied successfully!")
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ## ✅ Transformations Complete!
 ```
 
-#### 6.4 AI Agent Processes README
-- **Action:** AI agent reads the README file content
+#### 6.5 AI Agent Processes Transformation Files
+- **Action:** AI agent uses transformation rules already identified in Step 4
 - **Analyzes:** Transformation logic described in markdown format
-- **Generates:** Python/PySpark code to implement the transformations
-- **Updates:** The notebook cell in Step 3 with actual transformation code
-- **Examples of README parsing:**
+- **Generates:** Python/PySpark code to implement all transformations
+- **Updates:** The notebook cells with actual transformation code
+- **Standard Reference Examples:**
   - "Calculate total_price as quantity * unit_price" → `silver_df.withColumn("total_price", F.col("quantity") * F.col("unit_price"))`
   - "Convert customer_name to uppercase" → `silver_df.withColumn("customer_name", F.upper(F.col("customer_name")))`
+- **Custom README Examples:**
   - "Filter out records where status is 'cancelled'" → `silver_df.filter(F.col("status") != "cancelled")`
+  - "Create age_category based on age ranges" → Conditional logic with F.when()
 
-#### 6.5 Execute README Transformation Notebook
-- **Action:** Navigate to the created notebook using `openAsset` with `continueMessage: "Execute all cells to apply README-based transformations"`
+#### 6.6 Execute Transformation Notebook
+- **Action:** Navigate to the created notebook using `openAsset` with `continueMessage: "Execute all cells to apply standard and custom transformations"`
 - **Agent on notebook page will:** Execute all cells sequentially using `runNotebookCells`
 - **Validation:** Verify transformations were applied successfully
 - **Return:** Navigate back after successful transformation
-- **Output:** "✅ Step 6 Complete: README transformations applied to silver table"
+- **Output:** "✅ Step 6 Complete: All transformations (standard + custom) applied to silver table"
 
 ---
 
@@ -789,10 +932,13 @@ After completing all steps, verify:
 
 - ✅ Directory structure created (`{base_path}/DDL` and `{base_path}/SRC`)
 - ✅ Silver catalog and schema created (`{target_catalog}.{target_schema}`)
+- ✅ Transformation reference file read in Step 4
 - ✅ Bronze data analyzed and type recommendations generated
+- ✅ Calculated fields identified from transformation rules
 - ✅ Silver table created with proper data types
 - ✅ Metadata columns added to silver table
-- ✅ Additional transformations applied (if README provided)
+- ✅ Standard transformations applied from reference file
+- ✅ Custom transformations applied (if README provided)
 - ✅ All notebooks executed successfully
 
 **Final Output Message:**
@@ -803,14 +949,15 @@ After completing all steps, verify:
   - Source Bronze: {source_bronze_table}
   - Target Silver: {target_silver_table}
   - Transformation Mode: {transformation_mode}
-  - README Transformations: {readme_file_path if provided else "None"}
+  - Standard Transformations: Applied from reference file
+  - Custom Transformations: {readme_file_path if provided else "None"}
 
 📂 Created Notebooks:
   1. {base_path}/00_setup_silver_structure
   2. {base_path}/DDL/01_setup_silver_catalog_schema
   3. {base_path}/SRC/02_analyze_bronze_data
   4. {base_path}/SRC/03_bronze_to_silver_transform
-  5. {base_path}/SRC/04_apply_readme_transformations (if README provided)
+  5. {base_path}/SRC/04_apply_transformations
 
 ✅ Your silver layer is ready for use!
 
@@ -833,11 +980,20 @@ After completing all steps, verify:
 ### Issue: Decimal precision loss
 **Solution:** Increase DECIMAL precision in the transformation notebook. Default is DECIMAL(30,2) - adjust based on your data.
 
-### Issue: README file not found or not accessible
+### Issue: Reference file not found
+**Solution:** Verify the reference file exists at `/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md`. If missing, create it with standard transformation rules.
+
+### Issue: README file not accessible
 **Solution:** Verify the file path is correct and the file exists in the workspace. Use absolute paths starting with `/Workspace/`.
 
-### Issue: README transformations not working as expected
-**Solution:** Review the generated code in Step 3 of the README transformation notebook. You may need to manually adjust the logic based on your specific requirements.
+### Issue: Transformations not working as expected
+**Solution:** Review the generated code in Step 3 of the transformation notebook. Check if source columns exist with correct names. You may need to manually adjust the logic based on your specific schema.
+
+### Issue: Column not found during transformation
+**Solution:** The transformation logic checks for column existence before applying transformations. If a column is missing, the transformation is skipped. Review your bronze schema to ensure expected columns are present.
+
+### Issue: Cannot read transformation reference file in Step 4
+**Solution:** The file path may be incorrect. Verify the file exists at `/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md`. The notebook uses Python's `open()` function, so ensure the path is accessible.
 
 ---
 
@@ -851,35 +1007,52 @@ After completing all steps, verify:
 - Large numbers → BIGINT (for integers) or DOUBLE (for floats)
 - Financial data → DECIMAL(30,2) or appropriate precision
 
-**README File Format Guidelines:**
-For best results, structure your README transformation logic as:
+**Reference File Format (Tranformstions.md):**
+The standard reference file should follow this format:
 ```markdown
-# Transformation Rules
+## Data Transformation Steps
+
+1. **Calculate `field_name`:**
+   - Description of calculation logic
+
+2. **Standardize field_name:**
+   - Description of standardization logic
+```
+
+**Custom README File Format Guidelines:**
+For custom transformations, structure your README as:
+```markdown
+# Custom Transformation Rules
 
 ## Calculated Fields
-- total_amount = quantity * unit_price
-- discount_amount = total_amount * discount_percentage
+- field_name = calculation logic
+- another_field = another calculation
 
 ## String Transformations
-- customer_name: convert to uppercase
-- email: convert to lowercase and trim whitespace
+- field_name: conversion logic
+- email: lowercase and trim
 
 ## Conditional Logic
-- priority: if amount > 1000 then "High", if amount > 500 then "Medium", else "Low"
+- status_field: if condition then value, else other_value
 
 ## Date Calculations
-- days_since_order = current_date - order_date
+- days_field = current_date - other_date
 
 ## Filters
-- Remove records where status = "cancelled"
-- Keep only records where amount > 0
+- Remove records where condition
+- Keep only records where condition
 ```
 
 **Best Practices:**
 1. Always profile bronze data before transformation
-2. Review type recommendations before applying
-3. Test transformations on a sample first
-4. Document any custom casting logic
-5. Use README files for complex business logic
-6. Keep transformation notebooks versioned
-7. Validate results after each transformation step
+2. Read transformation reference file in Step 4 to understand calculated field requirements
+3. Review type recommendations before applying - ensure source columns for calculations are properly typed
+4. Test transformations on a sample first
+5. Document any custom casting logic
+6. Keep reference file updated with standard transformations
+7. Use custom README files for project-specific business logic
+8. Keep transformation notebooks versioned
+9. Validate results after each transformation step
+10. Check column existence before applying transformations
+11. Log all transformation steps for audit trail
+12. Verify source columns for calculated fields are cast to appropriate numeric types
