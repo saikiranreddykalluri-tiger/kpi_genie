@@ -1,7 +1,7 @@
 # Gold Data Load - Automated KPI Generation Skill
 
 ## Overview
-This skill automates the creation of Gold-layer KPI views from Silver tables. It analyzes source tables, generates aggregated KPI views, and creates them in your target catalog/schema.
+This skill automates the creation of Gold-layer KPI views from Silver tables. It analyzes source tables, applies data quality transformations, generates aggregated KPI views, and creates them in your target catalog/schema.
 
 ## Prerequisites
 - Silver table(s) loaded and ready
@@ -69,6 +69,7 @@ Use the following approach:
 3. Create a new notebook in the user's project folder
 4. Copy all cells from reference to the new notebook
 5. Update the configuration cell with actual values
+6. **Add null handling cell** after reading the silver table with fillna logic
 
 ### Step 4: Guide User Execution
 **Inform the user:**
@@ -79,18 +80,51 @@ Use the following approach:
 
 The notebook will automatically:
 - Analyze the source silver table
+- Apply null filling with default values
 - Identify KPI opportunities
 - Generate and create KPI views in the target schema
 
 ## What This System Does
 
 1. **Analyzes Source Table**: Reads the silver table schema and data
-2. **Identifies KPI Opportunities**: Determines which columns can be aggregated (numeric, categorical, date-based)
-3. **Generates KPI Views**: Creates views with aggregations like:
+2. **Applies Data Quality**: Fills null values with defaults using fillna:
+   - String columns: `"N/A"`
+   - Date/Timestamp columns: `"9999-12-03"`
+   - Integer columns: `0`
+   - Decimal columns: `0.0`
+3. **Identifies KPI Opportunities**: Determines which columns can be aggregated (numeric, categorical, date-based)
+4. **Generates KPI Views**: Creates views with aggregations like:
    - COUNT, SUM, AVG, MIN, MAX for numeric columns
    - COUNT, DISTINCT COUNT for categorical columns
    - Time-based aggregations (daily, weekly, monthly)
-4. **Creates Views in Target Schema**: Deploys the KPI views to your specified gold layer
+5. **Creates Views in Target Schema**: Deploys the KPI views to your specified gold layer
+
+## Null Handling Implementation
+
+The system automatically applies fillna transformations after reading the silver table:
+
+```python
+# Example fillna logic to be added after reading silver table
+from pyspark.sql.functions import col, coalesce, lit
+from pyspark.sql.types import StringType, DateType, TimestampType, IntegerType, LongType, DecimalType, DoubleType, FloatType
+
+# Read silver table
+df = spark.table(f"{SOURCE_CATALOG}.{SOURCE_SCHEMA}.{SOURCE_TABLE}")
+
+# Apply fillna based on data type
+for field in df.schema.fields:
+    col_name = field.name
+    col_type = field.dataType
+    
+    if isinstance(col_type, StringType):
+        df = df.fillna({"col_name": "N/A"})
+    elif isinstance(col_type, (DateType, TimestampType)):
+        df = df.withColumn(col_name, coalesce(col(col_name), lit("9999-12-03")))
+    elif isinstance(col_type, (IntegerType, LongType)):
+        df = df.fillna({col_name: 0})
+    elif isinstance(col_type, (DecimalType, DoubleType, FloatType)):
+        df = df.fillna({col_name: 0.0})
+```
 
 ## Assistant Workflow
 
@@ -104,8 +138,9 @@ When a user requests "Load Gold" or "Create KPI Views":
 4. **Parse the source table path**: Split catalog.schema.table into individual components
 5. **Clone the reference notebook**: Copy to user's project folder
 6. **Update configuration**: Replace placeholder variables with actual values
-7. **Confirm setup**: Inform user the notebook is ready to run
-8. **Guide execution**: Provide clear instructions for running the notebook
+7. **Add null handling logic**: Insert fillna cell after table reading step
+8. **Confirm setup**: Inform user the notebook is ready to run
+9. **Guide execution**: Provide clear instructions for running the notebook
 
 ## Configuration Parsing Example
 
@@ -138,6 +173,12 @@ If user needs custom KPIs beyond auto-generated ones:
 - Add custom KPI definitions manually after
 - Modify the cloned notebook to include additional logic
 
+### Custom Null Handling
+The default null filling values can be customized in the cloned notebook:
+- Modify the fillna cell to use different default values
+- Add conditional logic for specific columns
+- Skip null filling for certain columns if needed
+
 ## Error Handling
 
 Common issues:
@@ -145,6 +186,7 @@ Common issues:
 * **Permission denied**: Check user has CREATE VIEW permission on target schema
 * **Schema not found**: Ensure target catalog and schema exist before running
 * **Invalid table path**: Ensure source table follows catalog.schema.table format
+* **Data type mismatch**: Verify fillna defaults are compatible with column types
 
 ## Best Practices
 
@@ -153,6 +195,7 @@ Common issues:
 3. **Test with small tables first** before running on large datasets
 4. **Review generated KPIs** in the output before proceeding
 5. **Keep the reference notebook unchanged** for future use
+6. **Review null handling logic** to ensure defaults align with business requirements
 
 ## Example Full Interaction
 
