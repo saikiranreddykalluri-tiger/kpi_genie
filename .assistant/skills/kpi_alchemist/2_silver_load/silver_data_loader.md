@@ -250,289 +250,337 @@ print(f"\n✅ Verification complete: {catalog_name}.{schema_name} is ready for u
 
 **Only execute after Step 3 is complete**
 
-**IMPORTANT:** This step now includes reading the transformation reference file to understand what calculated fields and transformations are needed. This ensures type recommendations consider both raw data AND transformation requirements.
+**IMPORTANT:** This step uses an AI-powered DataType Definer Agent that leverages Claude Opus 4.6 to intelligently analyze bronze data and recommend optimal data types for the silver layer. The agent profiles columns, analyzes sample data, and uses LLM-based inference to make smart type recommendations.
 
 #### 4.1 Create Data Profiling Notebook
 - **Action:** Create a Python notebook named `02_analyze_bronze_data`
 - **Location:** `{base_path}/SRC/02_analyze_bronze_data`
 - **Content:** Use template below with user-provided values
-- **Key Enhancement:** Reads transformations.md file BEFORE analyzing data to identify source columns needed for calculated fields
+- **Key Feature:** AI-powered type inference using Claude Opus 4.6 for intelligent data type recommendations
+- **Reference File:** Code is also available at `./references/DataTypeDefinerAgent.py`
 
 **Template for Data Profiling Notebook:**
 ```python
 # Databricks notebook source
 # COMMAND ----------
 # MAGIC %md
-# MAGIC # Bronze Data Analysis & Type Recommendation
+# MAGIC # Bronze Data Analysis & Type Recommendation with AI Agent
 # MAGIC 
 # MAGIC **Source Table:** {source_bronze_table}
 # MAGIC **Target Table:** {target_silver_table}
+# MAGIC **Reference:** ./references/DataTypeDefinerAgent.py
 # MAGIC 
-# MAGIC This notebook analyzes bronze data and recommends optimal data types for silver layer.
-# MAGIC It also reads transformation rules to ensure source columns are properly typed for calculated fields.
+# MAGIC This notebook uses an AI-powered agent (DataType Definer Agent) to analyze bronze data and intelligently recommend optimal data types for silver layer using Claude Opus 4.6.
 
 # COMMAND ----------
-# Configuration
-source_table = "{source_bronze_table}"
-target_table = "{target_silver_table}"
-transformation_reference_path = "/Workspace/.assistant/skills/kpi_alchemist/2_silver_load/references/Tranformstions.md"
+# =============================================================================
+# Install Required Libraries
+# =============================================================================
+!pip install langgraph==0.2.65 langchain==0.3.16 langchain-core==0.3.32 \
+pydantic==2.10.6 sqlparse==0.5.3 openai==1.59.7 --quiet
 
 # COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 1: Read Transformation Reference File
-
-# COMMAND ----------
-# Read transformation reference to understand what calculated fields are needed
+# =============================================================================
+# Imports
+# =============================================================================
+import json
 import re
+from typing import List, Optional, Dict, Any, TypedDict
+from pydantic import BaseModel, Field, field_validator
+from langgraph.graph import StateGraph, END
+from pyspark.sql.functions import (
+    col, min as spark_min, max as spark_max,
+    count, countDistinct
+)
+import openai
 
-transformation_rules = {}
-required_source_columns = []
-calculated_fields = []
-
-try:
-    with open(transformation_reference_path.replace("/Workspace", "/Workspace"), 'r') as f:
-        transformation_content = f.read()
-    
-    print("📄 Transformation Reference File Content:")
-    print("=" * 80)
-    print(transformation_content)
-    print("=" * 80)
-    
-    # Parse for calculated field patterns
-    # Look for patterns like: total_price = price * quantity
-    calc_pattern = r'(\w+)\s*[=:]\s*(.+?)(?:\n|$)'
-    matches = re.findall(calc_pattern, transformation_content, re.MULTILINE)
-    
-    for field_name, formula in matches:
-        if any(keyword in formula.lower() for keyword in ['*', '+', '-', '/', 'cast', 'upper', 'lower', 'trim']):
-            calculated_fields.append(field_name)
-            # Extract column names from formula (simple heuristic)
-            column_refs = re.findall(r'\b([a-z_][a-z0-9_]*)\b', formula.lower())
-            required_source_columns.extend(column_refs)
-            transformation_rules[field_name] = formula
-    
-    print(f"\n✅ Found {len(calculated_fields)} calculated fields:")
-    for field in calculated_fields:
-        print(f"  - {field}: {transformation_rules.get(field, 'N/A')}")
-    
-    print(f"\n📊 Source columns needed for transformations:")
-    print(f"  {list(set(required_source_columns))}")
-    
-except Exception as e:
-    print(f"⚠️ Could not read transformation reference file: {e}")
-    print("ℹ️ Continuing with basic type analysis only")
-    transformation_content = ""
+print("✅ Libraries imported successfully")
 
 # COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 2: Read Bronze Table Sample
+# =============================================================================
+# Configuration
+# =============================================================================
+API_KEY = "sk-YFxU38F33HyLN_P-KexwPw"
+BASE_URL = "https://api.ai-gateway.tigeranalytics.com"
+MODEL_NAME = "claude-opus-4.6"
+
+client = openai.OpenAI(
+    api_key=API_KEY,
+    base_url=BASE_URL
+)
 
 # COMMAND ----------
-# Read bronze table
-bronze_df = spark.table(source_table)
+# =============================================================================
+# Pydantic Models
+# =============================================================================
+class ColumnSchema(BaseModel):
+    column_name: str
+    recommended_data_type: str
+    reasoning: str
 
-# Get row count
-total_rows = bronze_df.count()
-print(f"📊 Total rows in bronze table: {total_rows:,}")
+    @field_validator("recommended_data_type")
+    @classmethod
+    def uppercase_dtype(cls, v):
+        return v.upper()
 
-# Get sample for analysis (limit to 10,000 for performance)
-sample_df = bronze_df.limit(10000)
-sample_df.cache()
 
-print(f"📊 Sample size for analysis: {sample_df.count():,} rows")
+class TableSchemaOutput(BaseModel):
+    table_name: str
+    columns: List[ColumnSchema]
+    total_columns_analyzed: int
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 3: Display Sample Data
 
-# COMMAND ----------
-display(sample_df.limit(100))
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 4: Analyze Current Schema
-
-# COMMAND ----------
-# Show current schema
-print("🔍 Current Bronze Schema:")
-bronze_df.printSchema()
+class AgentState(TypedDict):
+    table_name: str
+    columns_to_analyze: List[str]
+    profiling_data: Dict[str, Any]
+    schema_output: Optional[TableSchemaOutput]
+    error: Optional[str]
 
 # COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 5: Column-by-Column Analysis with Transformation Awareness
+# =============================================================================
+# Profiling Function
+# =============================================================================
+def profile_columns(df, columns, table_name):
+    profiling_data = {
+        "table_name": table_name,
+        "columns": {}
+    }
+
+    for column in columns:
+        try:
+            stats = df.select(
+                count(col(column)).alias("count"),
+                countDistinct(col(column)).alias("distinct_count"),
+                spark_min(col(column)).alias("min_value"),
+                spark_max(col(column)).alias("max_value")
+            ).collect()[0]
+
+            profiling_data["columns"][column] = {
+                "spark_type": next(
+                    field.dataType.simpleString()
+                    for field in df.schema.fields
+                    if field.name == column
+                ),
+                "count": stats["count"],
+                "distinct_count": stats["distinct_count"],
+                "min_value": str(stats["min_value"]),
+                "max_value": str(stats["max_value"]),
+                "sample_values": [
+                    str(r[column])
+                    for r in df.select(column).limit(5).collect()
+                ],
+                "null_count": df.filter(col(column).isNull()).count()
+            }
+
+        except Exception as e:
+            profiling_data["columns"][column] = {
+                "spark_type": "unknown",
+                "error": str(e)
+            }
+
+    return profiling_data
 
 # COMMAND ----------
-from pyspark.sql import functions as F
-from pyspark.sql.types import *
+# =============================================================================
+# LangGraph Nodes
+# =============================================================================
+def data_profiling_node(state: AgentState):
+    try:
+        print(f"📊 Profiling table: {state['table_name']}")
 
-# Analyze each column
-column_analysis = []
+        df = spark.table(state["table_name"])
 
-for col_name in sample_df.columns:
-    print(f"\n{'='*60}")
-    print(f"📊 Analyzing column: {col_name}")
-    print(f"{'='*60}")
-    
-    # Check if this column is used in transformations
-    used_in_transformations = col_name in required_source_columns
-    if used_in_transformations:
-        print(f"  ⚠️ This column is used in transformation calculations")
-    
-    # Get current type
-    current_type = dict(sample_df.dtypes)[col_name]
-    
-    # Get distinct values (limit to 20 for display)
-    distinct_count = sample_df.select(col_name).distinct().count()
-    distinct_values = sample_df.select(col_name).distinct().limit(20).collect()
-    
-    # Get null count
-    null_count = sample_df.filter(F.col(col_name).isNull()).count()
-    null_percentage = (null_count / sample_df.count()) * 100
-    
-    # Get sample non-null values
-    non_null_samples = sample_df.filter(F.col(col_name).isNotNull()).select(col_name).limit(10).collect()
-    
-    print(f"  Current Type: {current_type}")
-    print(f"  Distinct Values: {distinct_count:,}")
-    print(f"  Null Count: {null_count:,} ({null_percentage:.2f}%)")
-    print(f"  Sample Values: {[row[0] for row in non_null_samples[:5]]}")
-    
-    # Recommend data type based on analysis
-    recommended_type = current_type  # Default to current type
-    recommendation_reason = "Keep current type"
-    
-    if current_type == "string" and distinct_count < sample_df.count():
-        # Try to infer better type
-        sample_values = [row[0] for row in non_null_samples if row[0] is not None]
-        
-        if sample_values:
-            # Check if it's numeric
-            try:
-                # Test for integer
-                int_values = [int(v) for v in sample_values]
-                recommended_type = "BIGINT"
-                recommendation_reason = "All values are integers"
-                
-                # If used in calculations, prioritize numeric type
-                if used_in_transformations:
-                    recommendation_reason += " (REQUIRED for calculations)"
-                
-                print(f"  ✅ Recommendation: BIGINT ({recommendation_reason})")
-            except:
-                try:
-                    # Test for decimal
-                    float_values = [float(v) for v in sample_values]
-                    
-                    # Check decimal places
-                    max_decimal_places = 0
-                    for v in sample_values:
-                        if '.' in str(v):
-                            decimal_part = str(v).split('.')[1]
-                            max_decimal_places = max(max_decimal_places, len(decimal_part))
-                    
-                    if max_decimal_places > 0 and max_decimal_places <= 4:
-                        recommended_type = f"DECIMAL(30, {max_decimal_places})"
-                        recommendation_reason = f"Decimal values detected with {max_decimal_places} decimal places"
-                    else:
-                        recommended_type = "DOUBLE"
-                        recommendation_reason = "Floating point values"
-                    
-                    # If used in calculations, prioritize numeric type
-                    if used_in_transformations:
-                        recommendation_reason += " (REQUIRED for calculations)"
-                    
-                    print(f"  ✅ Recommendation: {recommended_type} ({recommendation_reason})")
-                except:
-                    # Check if it's a date
-                    if any(keyword in col_name.lower() for keyword in ['date', 'dt', 'time', 'timestamp']):
-                        recommended_type = "TIMESTAMP"
-                        recommendation_reason = "Column name suggests temporal data"
-                        print(f"  ✅ Recommendation: TIMESTAMP ({recommendation_reason})")
-                    else:
-                        recommended_type = "STRING"
-                        recommendation_reason = "Keep as text"
-                        print(f"  ✅ Recommendation: STRING ({recommendation_reason})")
-    
-    column_analysis.append({
-        "column_name": col_name,
-        "current_type": current_type,
-        "recommended_type": recommended_type,
-        "distinct_count": distinct_count,
-        "null_count": null_count,
-        "null_percentage": f"{null_percentage:.2f}%",
-        "used_in_transformations": "Yes" if used_in_transformations else "No",
-        "recommendation_reason": recommendation_reason
-    })
+        if not state["columns_to_analyze"]:
+            state["columns_to_analyze"] = df.columns
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 6: Summary of Recommendations
+        state["profiling_data"] = profile_columns(
+            df,
+            state["columns_to_analyze"],
+            state["table_name"]
+        )
 
-# COMMAND ----------
-import pandas as pd
+        print(f"✅ Profiled {len(state['columns_to_analyze'])} columns")
 
-# Create summary DataFrame
-summary_df = spark.createDataFrame(column_analysis)
-display(summary_df)
+    except Exception as e:
+        state["error"] = f"Profiling Error: {str(e)}"
 
-# Save recommendations for use in transformation notebook
-summary_df.write.mode("overwrite").saveAsTable("temp.column_type_recommendations")
+    return state
 
-print("\n✅ Analysis complete! Recommendations saved to: temp.column_type_recommendations")
-print("\n📋 Next Step: Review recommendations and proceed to create transformation notebook")
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ## Step 7: Generate Transformation SQL with Calculated Fields
+def llm_type_inference_node(state: AgentState):
+    if state.get("error"):
+        return state
 
-# COMMAND ----------
-# Generate CAST statements
-cast_statements = []
-for analysis in column_analysis:
-    col = analysis['column_name']
-    rec_type = analysis['recommended_type']
-    
-    if analysis['current_type'] != rec_type:
-        cast_statements.append(f"  CAST({col} AS {rec_type}) AS {col}")
-    else:
-        cast_statements.append(f"  {col}")
+    try:
+        print("🤖 Running Claude Opus 4.6 Type Inference...")
 
-# Add placeholders for calculated fields from transformation rules
-if calculated_fields:
-    cast_statements.append("\n  -- Calculated fields (from transformation rules):")
-    for calc_field in calculated_fields:
-        formula = transformation_rules.get(calc_field, "TBD")
-        cast_statements.append(f"  -- {calc_field} = {formula}")
+        prompt = f"""
+You are a SQL datatype expert.
 
-# Generate full SQL
-transformation_sql = f"""
--- Recommended Silver Transformation SQL
--- Source: {source_table}
--- Target: {target_table}
+Rules:
+- Decimal values → DECIMAL(30,2)
+- Text values → STRING
+- Large integers → BIGINT
+- Date values → DATE
+- Timestamp values → TIMESTAMP
 
-SELECT
-{',\n'.join(cast_statements)}
-FROM {source_table}
+Profiling Data:
+{json.dumps(state['profiling_data'], indent=2)}
+
+Return JSON only:
+{{
+  "table_name": "",
+  "columns": [
+    {{
+      "column_name": "",
+      "recommended_data_type": "",
+      "reasoning": ""
+    }}
+  ],
+  "total_columns_analyzed": 0
+}}
 """
 
-print("📝 Generated Transformation SQL:")
-print(transformation_sql)
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a data engineering expert."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.1
+        )
 
-# Store for next notebook
-dbutils.jobs.taskValues.set(key="transformation_sql", value=transformation_sql)
+        llm_response = response.choices[0].message.content
 
-print("\n✅ Transformation SQL ready for next step")
-print("\n📊 Identified calculated fields that will be added in Step 6:")
-for field in calculated_fields:
-    print(f"  - {field}")
+        json_match = re.search(
+            r'```json\s*(.*?)\s*```',
+            llm_response,
+            re.DOTALL
+        )
+
+        json_str = (
+            json_match.group(1)
+            if json_match
+            else re.search(r'\{.*\}', llm_response, re.DOTALL).group(0)
+        )
+
+        state["schema_output"] = TableSchemaOutput(
+            **json.loads(json_str)
+        )
+
+        print("✅ Type inference completed")
+
+    except Exception as e:
+        state["error"] = f"LLM Error: {str(e)}"
+
+    return state
+
+
+def output_node(state: AgentState):
+    print("\n" + "=" * 80)
+    print("📋 DATA TYPE RECOMMENDATIONS")
+    print("=" * 80)
+
+    if state.get("error"):
+        print(f"\n❌ {state['error']}")
+        return state
+
+    schema = state["schema_output"]
+
+    print(f"\nTable: {schema.table_name}")
+    print(f"Columns Analyzed: {schema.total_columns_analyzed}\n")
+
+    for column in schema.columns:
+        print(f"Column: {column.column_name}")
+        print(f"Recommended Type: {column.recommended_data_type}")
+        print(f"Reasoning: {column.reasoning}\n")
+
+    return state
+
+# COMMAND ----------
+# =============================================================================
+# LangGraph Workflow
+# =============================================================================
+def create_datatype_definer_workflow():
+    workflow = StateGraph(AgentState)
+
+    workflow.add_node("profile_data", data_profiling_node)
+    workflow.add_node("infer_types", llm_type_inference_node)
+    workflow.add_node("output_results", output_node)
+
+    workflow.set_entry_point("profile_data")
+
+    workflow.add_edge("profile_data", "infer_types")
+    workflow.add_edge("infer_types", "output_results")
+    workflow.add_edge("output_results", END)
+
+    return workflow.compile()
+
+# COMMAND ----------
+# =============================================================================
+# Main Execution
+# =============================================================================
+print("\n🚀 Creating DataType Definer Agent...\n")
+
+datatype_agent = create_datatype_definer_workflow()
+
+initial_state: AgentState = {
+    "table_name": "{source_bronze_table}",  # Bronze table from Step 1
+    "columns_to_analyze": [],
+    "profiling_data": {},
+    "schema_output": None,
+    "error": None
+}
+
+print("🔄 Running Agent...\n")
+
+final_state = datatype_agent.invoke(initial_state)
+
+if final_state.get("schema_output"):
+    print("\n✅ Agent execution completed successfully!")
+else:
+    print("\n❌ Agent execution failed")
+
+# COMMAND ----------
+# =============================================================================
+# Save Results to Temp Table
+# =============================================================================
+import pandas as pd
+
+# Convert Pydantic model to dictionary
+schema_dict = final_state["schema_output"].dict() if hasattr(final_state["schema_output"], "dict") else final_state["schema_output"].model_dump()
+
+# Create DataFrame from the columns list
+summary_df = pd.DataFrame(schema_dict["columns"])
+
+# Convert to Spark DataFrame
+summary_spark_df = spark.createDataFrame(summary_df)
+
+# Display recommendations
+print("\n📊 Type Recommendations:")
+display(summary_spark_df)
+
+# Save to temp table for use in transformation notebook
+summary_spark_df.write.mode("overwrite").saveAsTable("genie.temp.column_type_recommendations")
+
+print("\n✅ Recommendations saved to: genie.temp.column_type_recommendations")
+print("\n📋 Next Step: Review recommendations and proceed to create transformation notebook")
 ```
 
 #### 4.2 Execute Data Profiling Notebook
-- **Action:** Navigate to the created notebook using `openAsset` with `continueMessage: "Execute all cells in this data profiling notebook to analyze bronze data, read transformation rules, and generate type recommendations"`
+- **Action:** Navigate to the created notebook using `openAsset` with `continueMessage: "Execute all cells in this data profiling notebook to run the AI agent, analyze bronze data, and generate intelligent type recommendations"`
 - **Agent on notebook page will:** Execute all cells sequentially using `runNotebookCells`
-- **Validation:** Review the analysis results, type recommendations, and identified transformation requirements
+- **Validation:** Review the AI-generated analysis results and type recommendations
+- **Output Table:** Results are saved to `genie.temp.column_type_recommendations`
 - **Return:** Navigate back after successful analysis
-- **Output:** "✅ Step 4 Complete: Bronze data analyzed, transformation rules parsed, and type recommendations generated"
+- **Output:** "✅ Step 4 Complete: Bronze data analyzed by AI agent, intelligent type recommendations generated and saved to genie.temp.column_type_recommendations"
 
 ---
 
